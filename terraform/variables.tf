@@ -1,17 +1,17 @@
 variable "app_name" {
-  description = "Nome da aplicação, usado nos arquivos de configuração gerados."
+  description = "Nome da aplicação, sem espaços ou acentos (usado como server_name)."
   type        = string
-  default     = "devsecops-scan"
+  default     = "devops-pratica-shift-left"
 }
 
 variable "app_port" {
-  description = "Porta em que a aplicação Flask escuta."
+  description = "Porta da aplicação Flask."
   type        = number
   default     = 5000
 }
 
 variable "environment" {
-  description = "Ambiente alvo (development, staging, production)."
+  description = "Ambiente alvo: development, staging ou production."
   type        = string
   default     = "production"
 }

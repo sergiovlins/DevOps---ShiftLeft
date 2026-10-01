@@ -1,0 +1,275 @@
+# ======================================================================
+# Pipeline de DevSecOps - DevOps - Prática Shift-Left
+#
+# Esta pipeline aplica o conceito de "Shift Left": a segurança é
+# verificada o mais cedo possível no ciclo de desenvolvimento, de
+# forma automatizada, a cada push ou pull request - em vez de ser
+# checada manualmente só no final (ou nunca).
+#
+# Fluxo implementado (ver também o README.md):
+#
+#   push / pull_request
+#           |
+#           v
+#        [ test ]             -> garante que a aplicação continua
+#                                  funcionando (testes automatizados)
+#           |
+#           v
+#        [ sast ]  (Semgrep)   -> procura padrões de código inseguro
+#                                  no código-fonte (SAST)
+#           |
+#           v
+#        [ sca  ]  (pip-audit) -> procura vulnerabilidades conhecidas
+#                                  (CVEs) nas dependências do projeto
+#           |
+#           v
+#        [ dast ]  (OWASP ZAP) -> ataca a aplicação em execução para
+#                                  encontrar falhas em tempo de execução
+#           |
+#           v
+#   [ terraform ]  (+ Trivy)   -> valida e gera a infraestrutura como
+#                                  código (estado final do ambiente),
+#                                  com uma checagem extra de segurança
+#                                  sobre o próprio código de infra
+#           |
+#           v
+#     [ resultado ]            -> PASS se tudo passou; se qualquer
+#                                  etapa falhar, a pipeline inteira
+#                                  fica vermelha (FAIL) no GitHub
+# ======================================================================
+
+name: DevSecOps Security Pipeline
+
+# O que dispara a pipeline: qualquer push ou pull request direcionado
+# à branch main. Ou seja, qualquer alteração de código já é analisada
+# automaticamente antes mesmo de ser mesclada - esse é o "Shift Left"
+# na prática.
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+
+  # --------------------------------------------------------------
+  # JOB: test
+  # Garante que a aplicação continua funcionando corretamente antes
+  # de gastar tempo com as análises de segurança. Não é uma etapa de
+  # segurança em si, mas é o primeiro "portão de qualidade" da
+  # pipeline - não faz sentido analisar a segurança de um código que
+  # nem está funcionando.
+  # --------------------------------------------------------------
+  test:
+    name: Testes automatizados
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configura o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instala as dependências do projeto
+        run: pip install -r requirements.txt
+
+      - name: Executa a suíte de testes
+        run: pytest -v --cov=app --cov-report=term
+
+  # --------------------------------------------------------------
+  # JOB: sast (Static Application Security Testing)
+  # Ferramenta: Semgrep.
+  # Analisa o CÓDIGO-FONTE da aplicação em busca de padrões
+  # inseguros (ex.: injeção, uso perigoso de funções, segredos
+  # hardcoded) SEM executar a aplicação. É a análise mais "à
+  # esquerda" possível: olha só para o código escrito pelo
+  # desenvolvedor, antes mesmo dele rodar.
+  # --------------------------------------------------------------
+  sast:
+    name: SAST - Semgrep
+    needs: test
+    runs-on: ubuntu-latest
+    # Uso a imagem oficial do Semgrep como container do job: ela já
+    # vem com a ferramenta instalada, sem precisar configurar Python
+    # manualmente só para isso.
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gera relatório Semgrep (JSON) como evidência
+        # "continue-on-error" é proposital aqui: quero que o
+        # relatório seja sempre gerado e guardado como artefato,
+        # mesmo quando existem findings. A decisão de "falhar a
+        # pipeline" fica a cargo do próximo passo, dedicado a isso.
+        run: semgrep scan --config auto --json --output semgrep-report.json
+        continue-on-error: true
+
+      - name: Upload do relatório Semgrep
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+
+      - name: Portão de qualidade SAST (falha a pipeline se houver findings)
+        run: semgrep scan --config auto --error
+
+  # --------------------------------------------------------------
+  # JOB: sca (Software Composition Analysis)
+  # Ferramenta: pip-audit.
+  # Analisa as DEPENDÊNCIAS do projeto (requirements.txt) em busca
+  # de vulnerabilidades conhecidas (CVEs) publicadas para as versões
+  # das bibliotecas usadas. Diferente do SAST, aqui o problema não
+  # está no código que eu escrevi, e sim em um pacote de terceiros
+  # que eu decidi usar.
+  # --------------------------------------------------------------
+  sca:
+    name: SCA - pip-audit
+    needs: sast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configura o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instala o pip-audit
+        run: pip install pip-audit
+
+      - name: Gera relatório pip-audit (JSON) como evidência
+        run: pip-audit -r requirements.txt -f json -o pip-audit-report.json
+        continue-on-error: true
+
+      - name: Upload do relatório pip-audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.json
+
+      - name: Portão de qualidade SCA (falha a pipeline se houver CVEs)
+        run: pip-audit -r requirements.txt
+
+  # --------------------------------------------------------------
+  # JOB: dast (Dynamic Application Security Testing)
+  # Ferramenta: OWASP ZAP (baseline scan).
+  # Diferente do SAST e do SCA, aqui a aplicação é efetivamente
+  # colocada no ar e "atacada" de fora, como um usuário malicioso
+  # faria, procurando falhas que só aparecem em tempo de execução
+  # (ex.: cabeçalhos de segurança ausentes, cookies mal configurados,
+  # exposição de informações sensíveis nas respostas HTTP).
+  # --------------------------------------------------------------
+  dast:
+    name: DAST - OWASP ZAP
+    needs: sca
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configura o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instala as dependências do projeto
+        run: pip install -r requirements.txt
+
+      - name: Sobe a aplicação em segundo plano
+        run: |
+          nohup python run.py > app.log 2>&1 &
+          echo "Aguardando a aplicação responder em /health..."
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:5000/health > /dev/null; then
+              echo "Aplicação no ar."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "A aplicação não respondeu a tempo."
+          cat app.log
+          exit 1
+
+      - name: Executa o OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "http://localhost:5000"
+          # Não quero que a action abra uma Issue no repositório com
+          # o resultado - só preciso do relatório como evidência.
+          allow_issue_writing: false
+          # Faz o job (e a pipeline) falhar quando o ZAP encontra
+          # alertas de risco - esse é o nosso portão de qualidade DAST.
+          fail_action: true
+
+  # --------------------------------------------------------------
+  # JOB: terraform (desafio opcional - Infraestrutura como Código)
+  # Valida e aplica a infraestrutura descrita em código (pasta
+  # terraform/), que representa o estado final do ambiente onde a
+  # aplicação rodaria (configuração de ambiente + proxy reverso já
+  # endurecido com cabeçalhos de segurança). Uso o provider "local"
+  # do Terraform de propósito: não preciso de credenciais de nuvem
+  # nem subir uma imagem Docker para demonstrar o conceito de IaC.
+  # Além disso, uso o Trivy para aplicar segurança também sobre o
+  # PRÓPRIO código de infraestrutura (não só sobre a aplicação).
+  # --------------------------------------------------------------
+  terraform:
+    name: Terraform - Infraestrutura como Código
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configura o Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: terraform init
+        run: terraform init
+
+      - name: terraform fmt (checa formatação do código)
+        run: terraform fmt -check
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: Análise de segurança do código de infraestrutura (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "config"
+          scan-ref: "terraform"
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+
+      - name: terraform plan
+        run: terraform plan -out=tfplan
+
+      - name: terraform apply (gera o estado final da infraestrutura)
+        run: terraform apply -auto-approve tfplan
+
+      - name: Upload dos artefatos gerados pela infraestrutura
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-output
+          path: terraform/output/
+
+  # --------------------------------------------------------------
+  # JOB: resultado
+  # Só é executado se TODAS as etapas de segurança (sast, sca, dast)
+  # e a validação de infraestrutura (terraform) tiverem passado. Se
+  # qualquer uma delas falhar, este job é pulado automaticamente e o
+  # GitHub marca a pipeline inteira como "failed" (vermelha) - esse é
+  # o FAIL do fluxo Push -> Pipeline -> ... -> PASS/FAIL. Quando tudo
+  # passa, este job roda e confirma o PASS.
+  # --------------------------------------------------------------
+  resultado:
+    name: Resultado final (PASS)
+    needs: [ sast, sca, dast, terraform ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pipeline aprovada
+        run: |
+          echo "PASS - SAST, SCA, DAST e validação de infraestrutura concluídos sem bloqueios."

@@ -17,4 +17,5 @@ pip-audit-report.json
 report_html.html
 report_json.json
 report_md.md
-security.yml
+
+.coverage
