@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.cache/
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+*.log
+
+# Relatórios gerados localmente pelas ferramentas de segurança
+# (ficam como evidência local ou em artefatos do GitHub Actions,
+# não precisam ser versionados).
+semgrep-report.json
+pip-audit-report.json
+report_html.html
+report_json.json
+report_md.md
+security.yml
